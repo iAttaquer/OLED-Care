@@ -7,14 +7,16 @@ edition = "2024"
 winit = "0.30.12"
 gpui = "0.2.2"
 raw-window-handle = "0.6"
-windows = { version = "0.62.2", features = [
+windows = { version = "0.62.0", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Dwm",
-  "Win32_UI_Magnification"
+  "Win32_UI_Magnification",
+  "Win32_Devices_Display"
 ] }
 anyhow = "1.0"
+gpui-component = "0.5.1"
 
 [build-dependencies]
 winres = "0.1"
