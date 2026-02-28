@@ -20,7 +20,12 @@ pub fn opacity_slider(
     cx: &mut gpui::Context<Controller>,
 ) -> impl IntoElement + use<> {
     let opacity_pct = ((opacity as f32 / 255.0) * 100.0).round() as u8;
-    let knob_position = (opacity as f32 / 255.0) * SLIDER_WIDTH;
+    // Compute track width from captured bounds (fallback to SLIDER_WIDTH) and knob position.
+    let track_width: f32 = slider_bounds
+        .get()
+        .map(|b| b.size.width.into())
+        .unwrap_or(SLIDER_WIDTH);
+    let knob_position = (opacity as f32 / 255.0) * track_width;
 
     div()
         .flex()
@@ -94,19 +99,27 @@ fn slider_track(
     cx: &mut gpui::Context<Controller>,
 ) -> impl IntoElement + use<> {
     div()
-        // Wrapper: captures child bounds via prepaint callback
+        // Wrapper: captures child bounds via prepaint callback (restore original signature)
         .on_children_prepainted({
             let bounds_cell = slider_bounds.clone();
+            // Restore original callback signature: bounds, window, cx (cx unused here).
             move |bounds, _window, _cx| {
                 if let Some(b) = bounds.first() {
+                    // Store the child's bounds so mouse coordinates can be translated later.
                     bounds_cell.set(Some(*b));
                 }
             }
         })
-        .child(
+        .child({
+            // Compute width from captured bounds (fallback to SLIDER_WIDTH).
+            let width = slider_bounds
+                .get()
+                .map(|b| b.size.width.into())
+                .unwrap_or(SLIDER_WIDTH);
+
             div()
                 .relative()
-                .w(px(SLIDER_WIDTH))
+                .w(px(width))
                 .h(px(28.0))
                 .flex()
                 .items_center()
@@ -152,7 +165,7 @@ fn slider_track(
                         .absolute()
                         .left(px(0.0))
                         .top(px(10.0))
-                        .w(px(SLIDER_WIDTH))
+                        .w(px(width))
                         .h(px(8.0))
                         .rounded(px(4.0))
                         .bg(rgb(0x333333)),
@@ -180,8 +193,8 @@ fn slider_track(
                         .bg(rgb(0xffffff))
                         .border_2()
                         .border_color(rgb(0x4CAF50)),
-                ),
-        )
+                )
+        })
 }
 
 /// Convert a mouse X position (in window coordinates) to an opacity value

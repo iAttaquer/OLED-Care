@@ -234,26 +234,5 @@ impl Render for Controller {
             .child(sep())
             // Activation panel
             .child(activation_panel)
-            // Footer
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .items_center()
-                    .mt_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x555555))
-                            .child("⚠️ Cursor and Start Menu are not dimmed (Win32 limitation)"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x444444))
-                            .child("The overlay is click-through — it never blocks interaction"),
-                    ),
-            )
     }
 }
