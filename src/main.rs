@@ -2,7 +2,7 @@ mod monitor;
 mod overlay;
 mod ui;
 
-use gpui::{AppContext, Application, WindowOptions};
+use gpui::{AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 
 use crate::monitor::enumerate_monitors;
 use crate::overlay::register_overlay_class;
@@ -44,6 +44,12 @@ fn main() {
                     title: Some("OLED Care".into()),
                     ..Default::default()
                 }),
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(530.0), px(720.0)),
+                    app,
+                ))),
+                is_resizable: false,
                 ..Default::default()
             },
             |_, cx| cx.new(move |_| Controller::new(monitors_clone)),
