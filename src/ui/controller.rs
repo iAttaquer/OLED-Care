@@ -1,12 +1,14 @@
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{Bounds, FontWeight, Pixels, div, px, rgb};
 
 use crate::monitor::MonitorInfo;
 use crate::overlay::OverlayManager;
+use crate::tray::TrayEvent;
 use crate::ui::components::{opacity_slider, switch};
 use crate::ui::monitor_list::monitor_list;
 
@@ -30,6 +32,9 @@ pub struct Controller {
     pub hwnd_tx: mpsc::Sender<(usize, usize)>,
     /// Receiver for `(monitor_index, hwnd_ptr)` notifications from overlay threads.
     hwnd_rx: mpsc::Receiver<(usize, usize)>,
+    /// Pending tray events delivered from the async polling task.
+    /// The task pushes events here and calls cx.notify(); render drains them.
+    tray_pending: Arc<Mutex<Vec<TrayEvent>>>,
     /// Cached bounds of the slider track element (updated every frame via
     /// `on_children_prepainted`). Stored in an `Rc<Cell>` so the prepaint
     /// closure can write to it without requiring `&mut self`.
@@ -38,17 +43,61 @@ pub struct Controller {
 
 impl Controller {
     /// Create a new controller for the given set of monitors.
-    pub fn new(monitors: Vec<MonitorInfo>) -> Self {
+    pub fn new(
+        monitors: Vec<MonitorInfo>,
+        tray_rx: mpsc::Receiver<TrayEvent>,
+        cx: &mut gpui::Context<Self>,
+    ) -> Self {
         let n = monitors.len();
         let (tx, rx) = mpsc::channel();
+
+        // Shared queue: the async polling task pushes TrayEvents here, then
+        // calls cx.notify() so render() is triggered even when the window is hidden.
+        let tray_pending: Arc<Mutex<Vec<TrayEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let pending_clone = tray_pending.clone();
+
+        // Spawn a background task that polls the mpsc channel every 100 ms.
+        // When an event arrives it is pushed into the shared queue and
+        // cx.notify() is called to wake up the GPUI render loop.
+        cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+
+                // Drain everything that arrived since the last tick.
+                let mut events = Vec::new();
+                while let Ok(ev) = tray_rx.try_recv() {
+                    events.push(ev);
+                }
+
+                if events.is_empty() {
+                    continue;
+                }
+
+                // Push into the shared queue and notify the entity.
+                {
+                    let mut guard = pending_clone.lock().unwrap();
+                    guard.extend(events);
+                }
+
+                // Wake up the view — if it has been dropped just stop.
+                if weak.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         Self {
             monitors,
             selected: vec![false; n],
             overlays_active: false,
             overlay_manager: OverlayManager::new(n),
-            opacity: 50, // ~20 % darkness
+            opacity: 50,
             hwnd_tx: tx,
             hwnd_rx: rx,
+            tray_pending,
             slider_bounds: Rc::new(Cell::new(None)),
         }
     }
@@ -63,6 +112,22 @@ impl Render for Controller {
         // ── Drain pending HWND notifications from overlay threads ────────
         while let Ok((idx, ptr)) = self.hwnd_rx.try_recv() {
             self.overlay_manager.register_hwnd(idx, ptr);
+        }
+
+        // ── Drain tray events ────────────────────────────────────────────
+        let pending: Vec<TrayEvent> = {
+            let mut guard = self.tray_pending.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for event in pending {
+            match event {
+                TrayEvent::Open => {
+                    crate::show_and_focus_window(_window);
+                }
+                TrayEvent::Quit => {
+                    cx.quit();
+                }
+            }
         }
 
         // ── Snapshot values for the closures / builders below ────────────
