@@ -100,6 +100,7 @@ impl Controller {
                                     }
                                 }
                                 TrayEvent::Quit => {
+                                    _controller.overlay_manager.deactivate();
                                     cx.quit();
                                 }
                             }

@@ -109,3 +109,9 @@ impl OverlayManager {
         }
     }
 }
+
+impl Drop for OverlayManager {
+    fn drop(&mut self) {
+        self.deactivate();
+    }
+}
