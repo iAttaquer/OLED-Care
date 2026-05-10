@@ -41,6 +41,13 @@ pub struct Controller {
     /// without going through render() (which is skipped for hidden windows).
     #[allow(dead_code)]
     main_hwnd: Arc<AtomicUsize>,
+    /// Monotonically-incrementing counter, advanced by one on every *effective*
+    /// toggle (i.e. only when `overlays_active` actually changes).
+    ///
+    /// Passed to `switch()` as part of the animation `ElementId`; changing it
+    /// causes GPUI to create a fresh `AnimationState` so the transition
+    /// replays from the beginning on each click.
+    switch_click_count: u64,
     /// Cached bounds of the slider track element (updated every frame via
     /// `on_children_prepainted`). Stored in an `Rc<Cell>` so the prepaint
     /// closure can write to it without requiring `&mut self`.
@@ -64,6 +71,9 @@ impl Controller {
         // Events are handled HERE — not in render() — because GPUI skips
         // render() for hidden windows. Handling them directly lets us call
         // ShowWindow/SetForegroundWindow even when the window is invisible.
+        //
+        // Switch animation is driven by GPUI's built-in `with_animation` and
+        // needs no manual ticking here.
         cx.spawn(async move |weak, cx| {
             loop {
                 cx.background_executor()
@@ -85,7 +95,7 @@ impl Controller {
                 // Process events and wake up the view (or quit).
                 // If the entity has been dropped, stop the loop.
                 if weak
-                    .update(cx, |_controller, cx| {
+                    .update(cx, |controller, cx| {
                         for event in &events {
                             match event {
                                 TrayEvent::Open => {
@@ -100,7 +110,11 @@ impl Controller {
                                     }
                                 }
                                 TrayEvent::Quit => {
-                                    _controller.overlay_manager.deactivate();
+                                    // Explicitly close all overlay windows before
+                                    // quitting so their Win32 threads exit cleanly
+                                    // (WM_CLOSE → WM_DESTROY → PostQuitMessage)
+                                    // rather than being killed by the OS.
+                                    controller.overlay_manager.deactivate();
                                     cx.quit();
                                 }
                             }
@@ -124,6 +138,7 @@ impl Controller {
             hwnd_tx: tx,
             hwnd_rx: rx,
             main_hwnd,
+            switch_click_count: 0,
             slider_bounds: Rc::new(Cell::new(None)),
         }
     }
@@ -144,6 +159,7 @@ impl Render for Controller {
         let is_active = self.overlays_active;
         let opacity_val = self.opacity;
         let any_selected = self.selected.iter().any(|&s| s);
+        let switch_click_count = self.switch_click_count;
 
         // Pre-compute which monitors currently have a live overlay.
         let overlay_alive: Vec<bool> = self
@@ -224,10 +240,12 @@ impl Render for Controller {
             )
             .child(switch(
                 is_active,
+                switch_click_count,
                 cx.listener(move |this, _, _window, cx| {
                     if this.overlays_active {
                         this.overlay_manager.deactivate();
                         this.overlays_active = false;
+                        this.switch_click_count += 1;
                     } else if this.selected.iter().any(|&s| s) {
                         this.overlays_active = true;
                         this.overlay_manager.activate(
@@ -236,6 +254,7 @@ impl Render for Controller {
                             this.opacity,
                             &this.hwnd_tx,
                         );
+                        this.switch_click_count += 1;
                     }
                     cx.notify();
                 }),
