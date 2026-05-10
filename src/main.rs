@@ -3,6 +3,8 @@ mod overlay;
 mod tray;
 mod ui;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use gpui::{AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
@@ -47,9 +49,12 @@ fn main() {
     // Start the system tray icon on its own thread.
     spawn_tray(tray_tx);
 
-    // Launch the GPUI application.
+    let shared_hwnd: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
     Application::new().run(move |app: &mut gpui::App| {
         let monitors_clone = monitors.clone();
+        let shared_hwnd_for_window = shared_hwnd.clone();
+        let shared_hwnd_for_ctrl = shared_hwnd.clone();
 
         let _window_handle = app
             .open_window(
@@ -67,18 +72,22 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    // Intercept the close button — hide instead of destroy.
+                    if let Some(hwnd) = gpui_hwnd(window) {
+                        shared_hwnd_for_window.store(hwnd.0 as usize, Ordering::Relaxed);
+                    }
+
                     window.on_window_should_close(cx, |window: &mut gpui::Window, _cx| {
                         if let Some(hwnd) = gpui_hwnd(window) {
                             unsafe {
                                 let _ = ShowWindow(hwnd, SW_HIDE);
                             }
                         }
-                        // Return false → GPUI must NOT destroy the window.
                         false
                     });
 
-                    cx.new(move |cx| Controller::new(monitors_clone, tray_rx, cx))
+                    cx.new(move |cx| {
+                        Controller::new(monitors_clone, tray_rx, shared_hwnd_for_ctrl, cx)
+                    })
                 },
             )
             .unwrap();
@@ -89,8 +98,6 @@ fn main() {
 
 /// Extract the Win32 HWND from a GPUI Window using raw-window-handle.
 pub fn gpui_hwnd(window: &gpui::Window) -> Option<HWND> {
-    // Use fully-qualified syntax to call the trait method instead of the
-    // inherent `Window::window_handle()` which returns `AnyWindowHandle`.
     let handle =
         <gpui::Window as raw_window_handle::HasWindowHandle>::window_handle(window).ok()?;
     if let RawWindowHandle::Win32(win32) = handle.as_raw() {

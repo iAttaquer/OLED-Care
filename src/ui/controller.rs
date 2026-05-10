@@ -1,7 +1,11 @@
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
+
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{SW_SHOW, SetForegroundWindow, ShowWindow};
 
 use gpui::prelude::*;
 use gpui::{Bounds, FontWeight, Pixels, div, px, rgb};
@@ -32,9 +36,11 @@ pub struct Controller {
     pub hwnd_tx: mpsc::Sender<(usize, usize)>,
     /// Receiver for `(monitor_index, hwnd_ptr)` notifications from overlay threads.
     hwnd_rx: mpsc::Receiver<(usize, usize)>,
-    /// Pending tray events delivered from the async polling task.
-    /// The task pushes events here and calls cx.notify(); render drains them.
-    tray_pending: Arc<Mutex<Vec<TrayEvent>>>,
+    /// Raw Win32 HWND of the main window (as `usize`; 0 = not yet set).
+    /// Shared with the tray background task so it can call ShowWindow directly
+    /// without going through render() (which is skipped for hidden windows).
+    #[allow(dead_code)]
+    main_hwnd: Arc<AtomicUsize>,
     /// Cached bounds of the slider track element (updated every frame via
     /// `on_children_prepainted`). Stored in an `Rc<Cell>` so the prepaint
     /// closure can write to it without requiring `&mut self`.
@@ -46,19 +52,18 @@ impl Controller {
     pub fn new(
         monitors: Vec<MonitorInfo>,
         tray_rx: mpsc::Receiver<TrayEvent>,
+        main_hwnd: Arc<AtomicUsize>,
         cx: &mut gpui::Context<Self>,
     ) -> Self {
         let n = monitors.len();
         let (tx, rx) = mpsc::channel();
+        let main_hwnd_clone = main_hwnd.clone();
 
-        // Shared queue: the async polling task pushes TrayEvents here, then
-        // calls cx.notify() so render() is triggered even when the window is hidden.
-        let tray_pending: Arc<Mutex<Vec<TrayEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let pending_clone = tray_pending.clone();
-
-        // Spawn a background task that polls the mpsc channel every 100 ms.
-        // When an event arrives it is pushed into the shared queue and
-        // cx.notify() is called to wake up the GPUI render loop.
+        // Spawn a background task that polls the tray mpsc channel every 100 ms.
+        //
+        // Events are handled HERE — not in render() — because GPUI skips
+        // render() for hidden windows. Handling them directly lets us call
+        // ShowWindow/SetForegroundWindow even when the window is invisible.
         cx.spawn(async move |weak, cx| {
             loop {
                 cx.background_executor()
@@ -75,14 +80,34 @@ impl Controller {
                     continue;
                 }
 
-                // Push into the shared queue and notify the entity.
-                {
-                    let mut guard = pending_clone.lock().unwrap();
-                    guard.extend(events);
-                }
+                let raw_hwnd = main_hwnd_clone.load(Ordering::Relaxed);
 
-                // Wake up the view — if it has been dropped just stop.
-                if weak.update(cx, |_, cx| cx.notify()).is_err() {
+                // Process events and wake up the view (or quit).
+                // If the entity has been dropped, stop the loop.
+                if weak
+                    .update(cx, |_controller, cx| {
+                        for event in &events {
+                            match event {
+                                TrayEvent::Open => {
+                                    // Show the window via Win32 directly — this works
+                                    // even when GPUI's render loop is paused.
+                                    if raw_hwnd != 0 {
+                                        unsafe {
+                                            let hwnd = HWND(raw_hwnd as *mut std::ffi::c_void);
+                                            let _ = ShowWindow(hwnd, SW_SHOW);
+                                            let _ = SetForegroundWindow(hwnd);
+                                        }
+                                    }
+                                }
+                                TrayEvent::Quit => {
+                                    cx.quit();
+                                }
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -97,7 +122,7 @@ impl Controller {
             opacity: 50,
             hwnd_tx: tx,
             hwnd_rx: rx,
-            tray_pending,
+            main_hwnd,
             slider_bounds: Rc::new(Cell::new(None)),
         }
     }
@@ -112,22 +137,6 @@ impl Render for Controller {
         // ── Drain pending HWND notifications from overlay threads ────────
         while let Ok((idx, ptr)) = self.hwnd_rx.try_recv() {
             self.overlay_manager.register_hwnd(idx, ptr);
-        }
-
-        // ── Drain tray events ────────────────────────────────────────────
-        let pending: Vec<TrayEvent> = {
-            let mut guard = self.tray_pending.lock().unwrap();
-            std::mem::take(&mut *guard)
-        };
-        for event in pending {
-            match event {
-                TrayEvent::Open => {
-                    crate::show_and_focus_window(_window);
-                }
-                TrayEvent::Quit => {
-                    cx.quit();
-                }
-            }
         }
 
         // ── Snapshot values for the closures / builders below ────────────
