@@ -8,13 +8,15 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{SW_SHOW, SetForegroundWindow, ShowWindow};
 
 use gpui::prelude::*;
-use gpui::{Animation, AnimationExt, AnyElement, Bounds, FontWeight, Pixels, div, px, rgb};
+use gpui::{
+    Animation, AnimationExt, AnyElement, Bounds, FontWeight, MouseButton, Pixels, div, px, rgb,
+};
 use std::f32::consts::PI;
 
 use crate::monitor::MonitorInfo;
 use crate::overlay::OverlayManager;
 use crate::tray::TrayEvent;
-use crate::ui::components::{opacity_slider, switch};
+use crate::ui::components::{opacity_from_mouse, opacity_slider, switch};
 use crate::ui::monitor_list::monitor_list;
 
 /// Central application controller.
@@ -57,10 +59,10 @@ pub struct Controller {
     /// `on_children_prepainted`). Stored in an `Rc<Cell>` so the prepaint
     /// closure can write to it without requiring `&mut self`.
     pub slider_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub is_dragging: bool,
 }
 
 impl Controller {
-    /// Create a new controller for the given set of monitors.
     pub fn new(
         monitors: Vec<MonitorInfo>,
         tray_rx: mpsc::Receiver<TrayEvent>,
@@ -71,14 +73,6 @@ impl Controller {
         let (tx, rx) = mpsc::channel();
         let main_hwnd_clone = main_hwnd.clone();
 
-        // Spawn a background task that polls the tray mpsc channel every 100 ms.
-        //
-        // Events are handled HERE — not in render() — because GPUI skips
-        // render() for hidden windows. Handling them directly lets us call
-        // ShowWindow/SetForegroundWindow even when the window is invisible.
-        //
-        // Switch animation is driven by GPUI's built-in `with_animation` and
-        // needs no manual ticking here.
         cx.spawn(async move |weak, cx| {
             loop {
                 cx.background_executor()
@@ -146,6 +140,7 @@ impl Controller {
             switch_click_count: 0,
             shake_count: 0,
             slider_bounds: Rc::new(Cell::new(None)),
+            is_dragging: false,
         }
     }
 }
@@ -164,6 +159,7 @@ impl Render for Controller {
         // ── Snapshot values for the closures / builders below ────────────
         let is_active = self.overlays_active;
         let opacity_val = self.opacity;
+        let is_dragging = self.is_dragging;
         let any_selected = self.selected.iter().any(|&s| s);
         let switch_click_count = self.switch_click_count;
         let shake_count = self.shake_count;
@@ -277,6 +273,7 @@ impl Render for Controller {
 
         // ── Assemble the full layout ─────────────────────────────────────
         div()
+            .relative()
             .flex()
             .flex_col()
             .gap_5()
@@ -380,5 +377,37 @@ impl Render for Controller {
             .child(sep())
             // Activation panel
             .child(activation_panel)
+            .when(is_dragging, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .w_full()
+                        .h_full()
+                        .on_mouse_move(cx.listener(
+                            |this, ev: &gpui::MouseMoveEvent, _window, cx| {
+                                if let Some(new_opacity) =
+                                    opacity_from_mouse(ev.position.x, &this.slider_bounds)
+                                {
+                                    if this.opacity != new_opacity {
+                                        this.opacity = new_opacity;
+                                        if this.overlays_active {
+                                            this.overlay_manager.update_opacity(this.opacity);
+                                        }
+                                        cx.notify();
+                                    }
+                                }
+                            },
+                        ))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _window, cx| {
+                                this.is_dragging = false;
+                                cx.notify();
+                            }),
+                        ),
+                )
+            })
     }
 }

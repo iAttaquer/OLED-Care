@@ -128,6 +128,7 @@ fn slider_track(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &gpui::MouseDownEvent, _window, cx| {
+                        this.is_dragging = true;
                         if let Some(new_opacity) =
                             opacity_from_mouse(ev.position.x, &this.slider_bounds)
                         {
@@ -201,7 +202,7 @@ fn slider_track(
 /// using the previously-captured slider bounds.
 ///
 /// Returns `None` if bounds have not been captured yet.
-fn opacity_from_mouse(
+pub(crate) fn opacity_from_mouse(
     mouse_x: Pixels,
     slider_bounds: &Rc<Cell<Option<Bounds<Pixels>>>>,
 ) -> Option<u8> {
