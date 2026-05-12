@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{Bounds, FontWeight, MouseButton, Pixels, div, px, rgb};
@@ -142,15 +143,27 @@ fn slider_track(
                         }
                     }),
                 )
-                // Drag to adjust value
+                // Drag to adjust value (within-bounds path — fires for one frame
+                // before the full-screen capture overlay in Controller takes over).
                 .on_mouse_move(
                     cx.listener(move |this, ev: &gpui::MouseMoveEvent, _window, cx| {
                         if ev.pressed_button == Some(MouseButton::Left) {
                             if let Some(new_opacity) =
                                 opacity_from_mouse(ev.position.x, &this.slider_bounds)
                             {
+                                // Always update raw state (cheap u8 write).
                                 if this.opacity != new_opacity {
                                     this.opacity = new_opacity;
+                                }
+
+                                // Same 60-fps throttle as the full-screen overlay handler.
+                                let now = Instant::now();
+                                let elapsed = this
+                                    .last_drag_flush
+                                    .map_or(Duration::MAX, |t| now.duration_since(t));
+
+                                if elapsed >= Duration::from_millis(16) {
+                                    this.last_drag_flush = Some(now);
                                     if this.overlays_active {
                                         this.overlay_manager.update_opacity(this.opacity);
                                     }

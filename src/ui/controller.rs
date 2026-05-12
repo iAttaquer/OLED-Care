@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{SW_SHOW, SetForegroundWindow, ShowWindow};
@@ -59,7 +59,15 @@ pub struct Controller {
     /// `on_children_prepainted`). Stored in an `Rc<Cell>` so the prepaint
     /// closure can write to it without requiring `&mut self`.
     pub slider_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Whether the user is currently dragging the opacity slider.
+    /// When true, a full-screen transparent capture overlay is rendered
+    /// so the drag continues even when the cursor leaves the slider bounds.
     pub is_dragging: bool,
+    /// Timestamp of the last combined UI + overlay flush during a slider drag.
+    /// Throttles `cx.notify()` and `PostMessageW` calls to ~60 fps so that
+    /// fast mouse movement (1000 Hz polling) does not flood the Win32 message
+    /// queue or trigger hundreds of full GPUI re-renders per second.
+    pub last_drag_flush: Option<Instant>,
 }
 
 impl Controller {
@@ -141,6 +149,7 @@ impl Controller {
             shake_count: 0,
             slider_bounds: Rc::new(Cell::new(None)),
             is_dragging: false,
+            last_drag_flush: None,
         }
     }
 }
@@ -390,8 +399,22 @@ impl Render for Controller {
                                 if let Some(new_opacity) =
                                     opacity_from_mouse(ev.position.x, &this.slider_bounds)
                                 {
+                                    // Always update the raw state — writing a u8 is free.
                                     if this.opacity != new_opacity {
                                         this.opacity = new_opacity;
+                                    }
+
+                                    // Throttle the expensive operations (GPUI re-render +
+                                    // Win32 PostMessageW) to ~60 fps so that a 1000 Hz
+                                    // mouse doesn't flood the DWM compositor or the GPUI
+                                    // render pipeline.
+                                    let now = Instant::now();
+                                    let elapsed = this
+                                        .last_drag_flush
+                                        .map_or(Duration::MAX, |t| now.duration_since(t));
+
+                                    if elapsed >= Duration::from_millis(16) {
+                                        this.last_drag_flush = Some(now);
                                         if this.overlays_active {
                                             this.overlay_manager.update_opacity(this.opacity);
                                         }
@@ -404,6 +427,12 @@ impl Render for Controller {
                             MouseButton::Left,
                             cx.listener(|this, _, _window, cx| {
                                 this.is_dragging = false;
+                                this.last_drag_flush = None;
+                                // Always flush the final value so the overlay
+                                // ends up at exactly the position the user released on.
+                                if this.overlays_active {
+                                    this.overlay_manager.update_opacity(this.opacity);
+                                }
                                 cx.notify();
                             }),
                         ),
