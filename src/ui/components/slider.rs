@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use gpui::prelude::*;
 use gpui::{Bounds, FontWeight, MouseButton, Pixels, div, px, rgb};
 
+use crate::ipc::UiMsg;
 use crate::ui::controller::Controller;
 
 /// Width of the slider track in pixels.
@@ -135,9 +136,7 @@ fn slider_track(
                         {
                             if this.opacity != new_opacity {
                                 this.opacity = new_opacity;
-                                if this.overlays_active {
-                                    this.overlay_manager.update_opacity(this.opacity);
-                                }
+                                let _ = this.cmd_tx.try_send(UiMsg::SetOpacity(this.opacity));
                                 cx.notify();
                             }
                         }
@@ -164,9 +163,7 @@ fn slider_track(
 
                                 if elapsed >= Duration::from_millis(16) {
                                     this.last_drag_flush = Some(now);
-                                    if this.overlays_active {
-                                        this.overlay_manager.update_opacity(this.opacity);
-                                    }
+                                    let _ = this.cmd_tx.try_send(UiMsg::SetOpacity(this.opacity));
                                     cx.notify();
                                 }
                             }
@@ -258,9 +255,7 @@ fn preset_btn(
             MouseButton::Left,
             cx.listener(move |this, _, _window, cx| {
                 this.opacity = target_val;
-                if this.overlays_active {
-                    this.overlay_manager.update_opacity(this.opacity);
-                }
+                let _ = this.cmd_tx.try_send(UiMsg::SetOpacity(this.opacity));
                 cx.notify();
             }),
         )

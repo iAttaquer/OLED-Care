@@ -1,6 +1,7 @@
 use gpui::prelude::*;
 use gpui::{ElementId, FontWeight, MouseButton, ScrollHandle, div, px, rgb};
 
+use crate::ipc::UiMsg;
 use crate::monitor::MonitorInfo;
 use crate::ui::components::checkbox;
 use crate::ui::controller::Controller;
@@ -74,6 +75,7 @@ pub fn monitor_list(
                 cx.listener(move |this, _, _window, cx| {
                     if !this.overlays_active {
                         this.selected[idx] = !this.selected[idx];
+                        let _ = this.cmd_tx.try_send(UiMsg::ToggleMonitor(idx));
                         cx.notify();
                     }
                 }),
@@ -83,6 +85,7 @@ pub fn monitor_list(
                 cx.listener(move |this, _, _window, cx| {
                     if !this.overlays_active {
                         this.selected[idx] = !this.selected[idx];
+                        let _ = this.cmd_tx.try_send(UiMsg::ToggleMonitor(idx));
                         cx.notify();
                     }
                 }),

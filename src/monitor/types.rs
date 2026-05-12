@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// Information about a connected display monitor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct MonitorInfo {
     /// Device name reported by Windows (e.g. `\\.\DISPLAY1`).
@@ -12,6 +14,7 @@ pub struct MonitorInfo {
     pub width: i32,
     /// Height in pixels.
     pub height: i32,
-    /// Raw `HMONITOR` handle stored as an opaque integer.
+    /// Raw HMONITOR handle as opaque integer (meaningful only in the process
+    /// that enumerated monitors; the UI process ignores this field).
     pub hmonitor: isize,
 }

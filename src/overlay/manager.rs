@@ -96,19 +96,14 @@ impl OverlayManager {
             }
         }
     }
-
-    /// Returns the number of overlays that are currently alive.
-    pub fn active_count(&self) -> usize {
-        self.states.iter().filter(|s| s.hwnd.is_some()).count()
-    }
-
-    /// Record a newly-received `HWND` for the given monitor index.
-    pub fn register_hwnd(&mut self, index: usize, ptr: usize) {
-        if index < self.states.len() {
-            self.states[index].hwnd = Some(HWND(ptr as *mut c_void));
-        }
-    }
 }
+
+// SAFETY: `HWND` is an opaque numeric handle in Win32. All cross-thread
+// interactions on `OverlayManager` use `PostMessageW`, which is explicitly
+// documented as safe to call from any thread. Mutable access is always
+// serialised through the surrounding `Mutex<OverlayManager>`.
+unsafe impl Send for OverlayManager {}
+unsafe impl Sync for OverlayManager {}
 
 impl Drop for OverlayManager {
     fn drop(&mut self) {

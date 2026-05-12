@@ -1,11 +1,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
-
-use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::{SW_SHOW, SetForegroundWindow, ShowWindow};
 
 use gpui::prelude::*;
 use gpui::{
@@ -13,37 +9,35 @@ use gpui::{
 };
 use std::f32::consts::PI;
 
+use crate::ipc::{DaemonState, UiMsg};
 use crate::monitor::MonitorInfo;
-use crate::overlay::OverlayManager;
-use crate::tray::TrayEvent;
 use crate::ui::components::{opacity_from_mouse, opacity_slider, switch};
 use crate::ui::monitor_list::monitor_list;
 
 /// Central application controller.
 ///
-/// Owns all shared state: the list of monitors, which ones are selected,
-/// the current opacity value, and the [`OverlayManager`] that drives the
-/// Win32 overlay windows.
+/// Holds a local optimistic cache of daemon state, plus the IPC channels used
+/// to send commands to the daemon and receive state-update replies.
 pub struct Controller {
+    // ── State synced from daemon (local optimistic cache) ─────────────────
     /// Information about every connected monitor.
     pub monitors: Vec<MonitorInfo>,
     /// Per-monitor selection flags (same length as `monitors`).
     pub selected: Vec<bool>,
     /// Whether overlay protection is currently enabled.
     pub overlays_active: bool,
-    /// Manages the lifecycle of per-monitor overlay windows.
-    pub overlay_manager: OverlayManager,
     /// Current overlay opacity (0–255).
     pub opacity: u8,
-    /// Sender for `(monitor_index, hwnd_ptr)` notifications from overlay threads.
-    pub hwnd_tx: mpsc::Sender<(usize, usize)>,
-    /// Receiver for `(monitor_index, hwnd_ptr)` notifications from overlay threads.
-    hwnd_rx: mpsc::Receiver<(usize, usize)>,
-    /// Raw Win32 HWND of the main window (as `usize`; 0 = not yet set).
-    /// Shared with the tray background task so it can call ShowWindow directly
-    /// without going through render() (which is skipped for hidden windows).
-    #[allow(dead_code)]
-    main_hwnd: Arc<AtomicUsize>,
+    /// Per-monitor flag: true if the daemon reports an active overlay window.
+    overlay_alive: Vec<bool>,
+
+    // ── IPC channels ──────────────────────────────────────────────────────
+    /// Send commands to the background IPC thread (→ daemon).
+    pub cmd_tx: mpsc::SyncSender<UiMsg>,
+    /// Receive state snapshots pushed by the background IPC thread (← daemon).
+    state_rx: mpsc::Receiver<DaemonState>,
+
+    // ── UI-only state (unchanged from before) ─────────────────────────────
     /// Monotonically-incrementing counter, advanced by one on every *effective*
     /// toggle (i.e. only when `overlays_active` actually changes).
     ///
@@ -64,72 +58,25 @@ pub struct Controller {
     /// so the drag continues even when the cursor leaves the slider bounds.
     pub is_dragging: bool,
     /// Timestamp of the last combined UI + overlay flush during a slider drag.
-    /// Throttles `cx.notify()` and `PostMessageW` calls to ~60 fps so that
-    /// fast mouse movement (1000 Hz polling) does not flood the Win32 message
-    /// queue or trigger hundreds of full GPUI re-renders per second.
+    /// Throttles `cx.notify()` and IPC sends to ~60 fps so that fast mouse
+    /// movement (1000 Hz polling) does not flood the daemon or GPUI pipeline.
     pub last_drag_flush: Option<Instant>,
 }
 
 impl Controller {
     pub fn new(
-        monitors: Vec<MonitorInfo>,
-        tray_rx: mpsc::Receiver<TrayEvent>,
-        main_hwnd: Arc<AtomicUsize>,
+        initial: DaemonState,
+        cmd_tx: mpsc::SyncSender<UiMsg>,
+        state_rx: mpsc::Receiver<DaemonState>,
         cx: &mut gpui::Context<Self>,
     ) -> Self {
-        let n = monitors.len();
-        let (tx, rx) = mpsc::channel();
-        let main_hwnd_clone = main_hwnd.clone();
-
+        // Spawn a background task that wakes up every 100 ms to poll state_rx.
         cx.spawn(async move |weak, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(100))
                     .await;
-
-                // Drain everything that arrived since the last tick.
-                let mut events = Vec::new();
-                while let Ok(ev) = tray_rx.try_recv() {
-                    events.push(ev);
-                }
-
-                if events.is_empty() {
-                    continue;
-                }
-
-                let raw_hwnd = main_hwnd_clone.load(Ordering::Relaxed);
-
-                // Process events and wake up the view (or quit).
-                // If the entity has been dropped, stop the loop.
-                if weak
-                    .update(cx, |controller, cx| {
-                        for event in &events {
-                            match event {
-                                TrayEvent::Open => {
-                                    // Show the window via Win32 directly — this works
-                                    // even when GPUI's render loop is paused.
-                                    if raw_hwnd != 0 {
-                                        unsafe {
-                                            let hwnd = HWND(raw_hwnd as *mut std::ffi::c_void);
-                                            let _ = ShowWindow(hwnd, SW_SHOW);
-                                            let _ = SetForegroundWindow(hwnd);
-                                        }
-                                    }
-                                }
-                                TrayEvent::Quit => {
-                                    // Explicitly close all overlay windows before
-                                    // quitting so their Win32 threads exit cleanly
-                                    // (WM_CLOSE → WM_DESTROY → PostQuitMessage)
-                                    // rather than being killed by the OS.
-                                    controller.overlay_manager.deactivate();
-                                    cx.quit();
-                                }
-                            }
-                        }
-                        cx.notify();
-                    })
-                    .is_err()
-                {
+                if weak.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
             }
@@ -137,14 +84,13 @@ impl Controller {
         .detach();
 
         Self {
-            monitors,
-            selected: vec![false; n],
-            overlays_active: false,
-            overlay_manager: OverlayManager::new(n),
-            opacity: 50,
-            hwnd_tx: tx,
-            hwnd_rx: rx,
-            main_hwnd,
+            monitors: initial.monitors,
+            selected: initial.selected,
+            overlays_active: initial.overlays_active,
+            opacity: initial.opacity,
+            overlay_alive: initial.overlay_alive,
+            cmd_tx,
+            state_rx,
             switch_click_count: 0,
             shake_count: 0,
             slider_bounds: Rc::new(Cell::new(None)),
@@ -160,9 +106,13 @@ impl Render for Controller {
         _window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
-        // ── Drain pending HWND notifications from overlay threads ────────
-        while let Ok((idx, ptr)) = self.hwnd_rx.try_recv() {
-            self.overlay_manager.register_hwnd(idx, ptr);
+        // ── Drain pending state updates from daemon ───────────────────────
+        while let Ok(state) = self.state_rx.try_recv() {
+            self.monitors = state.monitors;
+            self.selected = state.selected;
+            self.opacity = state.opacity;
+            self.overlays_active = state.overlays_active;
+            self.overlay_alive = state.overlay_alive;
         }
 
         // ── Snapshot values for the closures / builders below ────────────
@@ -174,12 +124,7 @@ impl Render for Controller {
         let shake_count = self.shake_count;
 
         // Pre-compute which monitors currently have a live overlay.
-        let overlay_alive: Vec<bool> = self
-            .overlay_manager
-            .states
-            .iter()
-            .map(|s| s.hwnd.is_some())
-            .collect();
+        let overlay_alive = self.overlay_alive.clone();
 
         // ── Monitor list ─────────────────────────────────────────────────
         let mon_list = monitor_list(
@@ -194,7 +139,7 @@ impl Render for Controller {
         let slider = opacity_slider(opacity_val, &self.slider_bounds, is_active, cx);
 
         // ── Activation panel ─────────────────────────────────────────────
-        let active_count = self.overlay_manager.active_count();
+        let active_count = self.overlay_alive.iter().filter(|&&a| a).count();
 
         let activation_panel = div()
             .flex()
@@ -255,20 +200,16 @@ impl Render for Controller {
                 switch_click_count,
                 cx.listener(move |this, _, _window, cx| {
                     if this.overlays_active {
-                        this.overlay_manager.deactivate();
+                        // Optimistic update + send command
                         this.overlays_active = false;
                         this.switch_click_count += 1;
-                        this.shake_count = 0; // clear any leftover shake state
+                        this.shake_count = 0;
+                        let _ = this.cmd_tx.try_send(UiMsg::SetActive(false));
                     } else if this.selected.iter().any(|&s| s) {
                         this.overlays_active = true;
-                        this.overlay_manager.activate(
-                            &this.monitors,
-                            &this.selected,
-                            this.opacity,
-                            &this.hwnd_tx,
-                        );
                         this.switch_click_count += 1;
-                        this.shake_count = 0; // clear any leftover shake state
+                        this.shake_count = 0;
+                        let _ = this.cmd_tx.try_send(UiMsg::SetActive(true));
                     } else {
                         // No monitors selected — shake the hint label.
                         this.shake_count += 1;
@@ -405,9 +346,8 @@ impl Render for Controller {
                                     }
 
                                     // Throttle the expensive operations (GPUI re-render +
-                                    // Win32 PostMessageW) to ~60 fps so that a 1000 Hz
-                                    // mouse doesn't flood the DWM compositor or the GPUI
-                                    // render pipeline.
+                                    // IPC send) to ~60 fps so that a 1000 Hz mouse doesn't
+                                    // flood the daemon or the GPUI render pipeline.
                                     let now = Instant::now();
                                     let elapsed = this
                                         .last_drag_flush
@@ -415,9 +355,8 @@ impl Render for Controller {
 
                                     if elapsed >= Duration::from_millis(16) {
                                         this.last_drag_flush = Some(now);
-                                        if this.overlays_active {
-                                            this.overlay_manager.update_opacity(this.opacity);
-                                        }
+                                        let _ =
+                                            this.cmd_tx.try_send(UiMsg::SetOpacity(this.opacity));
                                         cx.notify();
                                     }
                                 }
@@ -428,11 +367,7 @@ impl Render for Controller {
                             cx.listener(|this, _, _window, cx| {
                                 this.is_dragging = false;
                                 this.last_drag_flush = None;
-                                // Always flush the final value so the overlay
-                                // ends up at exactly the position the user released on.
-                                if this.overlays_active {
-                                    this.overlay_manager.update_opacity(this.opacity);
-                                }
+                                let _ = this.cmd_tx.try_send(UiMsg::SetOpacity(this.opacity));
                                 cx.notify();
                             }),
                         ),
