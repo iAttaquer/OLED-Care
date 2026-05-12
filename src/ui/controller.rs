@@ -70,13 +70,25 @@ impl Controller {
         state_rx: mpsc::Receiver<DaemonState>,
         cx: &mut gpui::Context<Self>,
     ) -> Self {
-        // Spawn a background task that wakes up every 100 ms to poll state_rx.
+        // Spawn a background task that wakes up every 100 ms to pull the
+        // latest daemon state.  Sending GetState means the IPC thread will
+        // push a fresh DaemonState into state_rx, which render() then drains.
+        // This also catches state changes made outside the UI (e.g. the
+        // system-tray toggle) without requiring a daemon→UI push protocol.
         cx.spawn(async move |weak, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(100))
                     .await;
-                if weak.update(cx, |_, cx| cx.notify()).is_err() {
+                if weak
+                    .update(cx, |this, cx| {
+                        // try_send won't block; if the channel is full we
+                        // simply skip this tick and catch up on the next one.
+                        let _ = this.cmd_tx.try_send(UiMsg::GetState);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }

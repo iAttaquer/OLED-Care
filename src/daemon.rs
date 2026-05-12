@@ -71,16 +71,21 @@ pub fn run_daemon() {
     // Track whether a UI window is currently open (to avoid spawning duplicates).
     let ui_open = Arc::new(AtomicBool::new(false));
 
+    // Shared flag: true when overlays are currently active.
+    // Passed to the tray so the menu label stays in sync.
+    let active_flag = Arc::new(AtomicBool::new(false));
+
     // Start the tray icon thread.
     let (tray_tx, tray_rx) = mpsc::channel::<TrayEvent>();
-    spawn_tray(tray_tx);
+    spawn_tray(tray_tx, active_flag.clone());
 
     // Start the TCP IPC server on a background thread.
     {
         let state = state.clone();
         let mgr = overlay_mgr.clone();
         let ui_open = ui_open.clone();
-        thread::spawn(move || run_tcp_server(state, mgr, ui_open));
+        let active_flag = active_flag.clone();
+        thread::spawn(move || run_tcp_server(state, mgr, ui_open, active_flag));
     }
 
     // Spawn the initial UI window so the user sees it on first launch.
@@ -101,6 +106,31 @@ pub fn run_daemon() {
                 TrayEvent::Quit => {
                     overlay_mgr.lock().unwrap().deactivate();
                     std::process::exit(0);
+                }
+                TrayEvent::Toggle => {
+                    let mut s = state.lock().unwrap();
+                    if s.overlays_active {
+                        // ── Disable ──────────────────────────────────────
+                        s.overlays_active = false;
+                        drop(s);
+                        overlay_mgr.lock().unwrap().deactivate();
+                        active_flag.store(false, Ordering::Relaxed);
+                    } else {
+                        // ── Enable (only if at least one monitor selected) ─
+                        if s.selected.iter().any(|&sel| sel) {
+                            let monitors = s.monitors.clone();
+                            let selected = s.selected.clone();
+                            let opacity = s.opacity;
+                            drop(s);
+                            let (dummy_tx, _dummy_rx) = mpsc::channel::<(usize, usize)>();
+                            overlay_mgr
+                                .lock()
+                                .unwrap()
+                                .activate(&monitors, &selected, opacity, &dummy_tx);
+                            state.lock().unwrap().overlays_active = true;
+                            active_flag.store(true, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         }
@@ -126,6 +156,7 @@ fn run_tcp_server(
     state: Arc<Mutex<CoreState>>,
     mgr: Arc<Mutex<OverlayManager>>,
     ui_open: Arc<AtomicBool>,
+    active_flag: Arc<AtomicBool>,
 ) {
     let addr = format!("127.0.0.1:{}", DAEMON_PORT);
     let listener = match TcpListener::bind(&addr) {
@@ -143,9 +174,10 @@ fn run_tcp_server(
                 let state = state.clone();
                 let mgr = mgr.clone();
                 let ui_open = ui_open.clone();
+                let active_flag = active_flag.clone();
                 thread::spawn(move || {
                     ui_open.store(true, Ordering::Relaxed);
-                    handle_client(s, state, mgr);
+                    handle_client(s, state, mgr, active_flag);
                     ui_open.store(false, Ordering::Relaxed);
                 });
             }
@@ -157,7 +189,12 @@ fn run_tcp_server(
 // ── Client handler ────────────────────────────────────────────────────────────
 
 /// Handle one UI client connection in a loop until it disconnects.
-fn handle_client(stream: TcpStream, state: Arc<Mutex<CoreState>>, mgr: Arc<Mutex<OverlayManager>>) {
+fn handle_client(
+    stream: TcpStream,
+    state: Arc<Mutex<CoreState>>,
+    mgr: Arc<Mutex<OverlayManager>>,
+    active_flag: Arc<AtomicBool>,
+) {
     let _ = stream.set_nodelay(true);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut writer = BufWriter::new(stream);
@@ -222,6 +259,7 @@ fn handle_client(stream: TcpStream, state: Arc<Mutex<CoreState>>, mgr: Arc<Mutex
                             .activate(&monitors, &selected, opacity, &dummy_tx);
 
                         state.lock().unwrap().overlays_active = true;
+                        active_flag.store(true, Ordering::Relaxed);
                     }
                     // if already active: lock guard drops here, nothing to do
                 } else {
@@ -232,6 +270,7 @@ fn handle_client(stream: TcpStream, state: Arc<Mutex<CoreState>>, mgr: Arc<Mutex
                         s.overlays_active = false;
                         drop(s); // release before locking mgr
                         mgr.lock().unwrap().deactivate();
+                        active_flag.store(false, Ordering::Relaxed);
                     }
                 }
             }

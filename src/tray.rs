@@ -3,34 +3,47 @@
 //! This module runs a dedicated background thread that:
 //! 1. Creates a hidden message-only Win32 window to receive tray notifications.
 //! 2. Registers a system tray icon via `Shell_NotifyIconW`.
-//! 3. On right-click shows a popup menu with "Open" and "Close" items.
-//! 4. Communicates back to the main thread via [`TrayEvent`] through an `mpsc` channel.
-//! 5. Receives the GPUI window HWND and posts `WM_TRAY_WAKE` to nudge the message pump
-//!    whenever an event is pushed, so the GPUI render loop picks it up promptly.
+//! 3. On right-click shows a dark-themed popup menu with "Enable/Disable
+//!    Protection", "Open", and "Close" items.
+//! 4. Communicates back to the main thread via [`TrayEvent`] through an `mpsc`
+//!    channel.
+//!
+//! ### Dark mode
+//! Dark menus are achieved by two complementary mechanisms:
+//! * `SetPreferredAppMode(ForceDark)` (uxtheme ordinal 135) — tells Windows
+//!   that this process prefers dark UI.
+//! * `SetWindowTheme(popup_hwnd, "DarkMode_Explorer", None)` applied inside
+//!   the `WM_INITMENUPOPUP` handler, which fires before the menu is painted.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, GetSystemMetrics, IDI_APPLICATION, LoadIconW, MF_STRING, MSG,
-    PostQuitMessage, RegisterClassW, SM_CYSMICON, SetForegroundWindow, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-    WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    FindWindowExW, GetCursorPos, GetMessageW, GetSystemMetrics, IDI_APPLICATION, LoadIconW,
+    MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW, SM_CYSMICON,
+    SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TrackPopupMenu,
+    TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_INITMENUPOPUP, WM_LBUTTONDBLCLK,
+    WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
+use windows::core::PCSTR;
 use windows::core::PCWSTR;
 
 // ── Message constants ────────────────────────────────────────────────────────
 
-/// The window message posted by the shell when the user interacts with the tray icon.
+/// Shell callback message posted to our tray window on user interaction.
 const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
 
 /// Menu item IDs.
+const IDM_TOGGLE: usize = 1000;
 const IDM_OPEN: usize = 1001;
 const IDM_QUIT: usize = 1002;
 
@@ -43,32 +56,38 @@ pub enum TrayEvent {
     Open,
     /// User clicked "Close" — the application should exit.
     Quit,
+    /// User clicked the enable/disable toggle item.
+    Toggle,
 }
 
 /// Spawn the tray background thread.
 ///
-/// * `event_tx` — sender used to push [`TrayEvent`]s toward the main thread.
-/// * `gpui_hwnd_rx` — receiver that will eventually yield the raw GPUI window
-///   HWND (as `usize`) so the tray thread can post `WM_TRAY_WAKE` to nudge
-///   the Win32 message pump whenever a new event is enqueued.
-pub fn spawn_tray(event_tx: mpsc::Sender<TrayEvent>) {
-    thread::spawn(move || run_tray_thread(event_tx));
+/// * `event_tx`   — sender used to push [`TrayEvent`]s toward the main thread.
+/// * `active`     — shared flag that reflects whether overlay protection is
+///                  currently enabled. The tray reads this to label the menu
+///                  item correctly ("Enable" vs "Disable").
+pub fn spawn_tray(event_tx: mpsc::Sender<TrayEvent>, active: Arc<AtomicBool>) {
+    thread::spawn(move || run_tray_thread(event_tx, active));
 }
 
 // ── Thread-local state ───────────────────────────────────────────────────────
 
 thread_local! {
-    /// Sender for tray events — stored here so the static `wnd_proc` can reach it.
     static TX: std::cell::RefCell<Option<mpsc::Sender<TrayEvent>>> =
         std::cell::RefCell::new(None);
 
-
+    /// Shared flag reflecting whether overlays are currently active.
+    static ACTIVE: std::cell::RefCell<Option<Arc<AtomicBool>>> =
+        std::cell::RefCell::new(None);
 }
 
 // ── Internal implementation ──────────────────────────────────────────────────
 
-fn run_tray_thread(event_tx: mpsc::Sender<TrayEvent>) {
+fn run_tray_thread(event_tx: mpsc::Sender<TrayEvent>, active: Arc<AtomicBool>) {
     unsafe {
+        // ── Apply dark mode to this process's menus ───────────────────────
+        try_enable_dark_mode();
+
         // ── Register a message-only window class ─────────────────────────
         let hinstance: HINSTANCE = match GetModuleHandleW(None) {
             Ok(h) => h.into(),
@@ -85,7 +104,6 @@ fn run_tray_thread(event_tx: mpsc::Sender<TrayEvent>) {
             lpszClassName: PCWSTR(class_name_buf.as_ptr()),
             ..Default::default()
         };
-        // Ignore re-registration errors (harmless on restart).
         let _ = RegisterClassW(&wc);
 
         // ── Create a message-only (hidden) window ────────────────────────
@@ -113,8 +131,9 @@ fn run_tray_thread(event_tx: mpsc::Sender<TrayEvent>) {
             }
         };
 
-        // ── Store sender in thread-local so wnd_proc can reach it ────────
+        // ── Store state in thread-locals so wnd_proc can reach it ────────
         TX.with(|cell| *cell.borrow_mut() = Some(event_tx));
+        ACTIVE.with(|cell| *cell.borrow_mut() = Some(active));
 
         // ── Register the tray icon ────────────────────────────────────────
         let icon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
@@ -161,21 +180,18 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     unsafe {
         if msg == WM_TRAY_CALLBACK {
-            // Low word of lparam carries the mouse/keyboard notification code.
             let event = (lparam.0 & 0xFFFF) as u32;
-
             match event {
-                // Right-click → show context menu.
-                e if e == WM_RBUTTONUP => {
-                    show_context_menu(hwnd);
-                }
-                // Double left-click → open the main window.
-                e if e == WM_LBUTTONDBLCLK => {
-                    send_event(TrayEvent::Open);
-                }
+                e if e == WM_RBUTTONUP => show_context_menu(hwnd),
+                e if e == WM_LBUTTONDBLCLK => send_event(TrayEvent::Open),
                 _ => {}
             }
+            return LRESULT(0);
+        }
 
+        // Fires just before the popup is painted — apply dark theme here.
+        if msg == WM_INITMENUPOPUP {
+            apply_dark_theme_to_popup();
             return LRESULT(0);
         }
 
@@ -190,13 +206,62 @@ unsafe extern "system" fn wnd_proc(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Send a [`TrayEvent`] through the thread-local sender.
 fn send_event(event: TrayEvent) {
     TX.with(|cell| {
         if let Some(tx) = cell.borrow().as_ref() {
             let _ = tx.send(event);
         }
     });
+}
+
+fn is_active() -> bool {
+    ACTIVE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    })
+}
+
+// ── Dark mode helpers ─────────────────────────────────────────────────────────
+
+/// Call undocumented uxtheme ordinals to make Windows render dark menus for
+/// this process.  Silently does nothing on older Windows versions where these
+/// ordinals don't exist.
+unsafe fn try_enable_dark_mode() {
+    unsafe {
+        let Ok(uxtheme) = LoadLibraryW(windows::core::w!("uxtheme.dll")) else {
+            return;
+        };
+
+        // Ordinal 135 — SetPreferredAppMode(PreferredAppMode) -> PreferredAppMode
+        //   0 = Default, 1 = AllowDark, 2 = ForceDark, 3 = ForceLight
+        type FnSetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
+        if let Some(f) = GetProcAddress(uxtheme, PCSTR(135usize as *const u8)) {
+            let set_mode: FnSetPreferredAppMode = std::mem::transmute(f);
+            set_mode(2); // ForceDark
+        }
+
+        // Ordinal 136 — FlushMenuThemes() — refreshes cached theme data.
+        type FnFlushMenuThemes = unsafe extern "system" fn();
+        if let Some(f) = GetProcAddress(uxtheme, PCSTR(136usize as *const u8)) {
+            let flush: FnFlushMenuThemes = std::mem::transmute(f);
+            flush();
+        }
+    }
+}
+
+/// Find the currently-initialising popup menu window (class `#32768`) and
+/// apply the `DarkMode_Explorer` theme so Windows paints it with dark colors.
+unsafe fn apply_dark_theme_to_popup() {
+    unsafe {
+        let class_name: Vec<u16> = "#32768\0".encode_utf16().collect();
+        if let Ok(menu_hwnd) =
+            FindWindowExW(None, None, PCWSTR(class_name.as_ptr()), PCWSTR::null())
+        {
+            let _ = SetWindowTheme(menu_hwnd, windows::core::w!("DarkMode_Explorer"), None);
+        }
+    }
 }
 
 // ── Context menu ─────────────────────────────────────────────────────────────
@@ -211,19 +276,33 @@ unsafe fn show_context_menu(hwnd: HWND) {
             }
         };
 
-        let open_str: Vec<u16> = "Open\0".encode_utf16().collect();
-        let quit_str: Vec<u16> = "Close\0".encode_utf16().collect();
+        // ── Toggle item ───────────────────────────────────────────────────
+        let active = is_active();
+        let toggle_label: Vec<u16> = if active {
+            "Disable Protection\0"
+        } else {
+            "Enable Protection\0"
+        }
+        .encode_utf16()
+        .collect();
+        let _ = AppendMenuW(hmenu, MF_STRING, IDM_TOGGLE, PCWSTR(toggle_label.as_ptr()));
 
+        // ── Separator ─────────────────────────────────────────────────────
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        // ── Open ──────────────────────────────────────────────────────────
+        let open_str: Vec<u16> = "Open\0".encode_utf16().collect();
         let _ = AppendMenuW(hmenu, MF_STRING, IDM_OPEN, PCWSTR(open_str.as_ptr()));
+
+        // ── Close ─────────────────────────────────────────────────────────
+        let quit_str: Vec<u16> = "Close\0".encode_utf16().collect();
         let _ = AppendMenuW(hmenu, MF_STRING, IDM_QUIT, PCWSTR(quit_str.as_ptr()));
 
-        // Required so the menu dismisses when the user clicks elsewhere.
+        // Required so the menu dismisses on click-away.
         let _ = SetForegroundWindow(hwnd);
 
         let mut pt = windows::Win32::Foundation::POINT::default();
         let _ = GetCursorPos(&mut pt);
-
-        // Place menu just above the tray icon area.
         let icon_h = GetSystemMetrics(SM_CYSMICON);
 
         let cmd = TrackPopupMenu(
@@ -239,6 +318,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
         let _ = DestroyMenu(hmenu);
 
         match cmd.0 as usize {
+            IDM_TOGGLE => send_event(TrayEvent::Toggle),
             IDM_OPEN => send_event(TrayEvent::Open),
             IDM_QUIT => send_event(TrayEvent::Quit),
             _ => {}
