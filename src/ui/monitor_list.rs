@@ -26,7 +26,7 @@ pub fn monitor_list(
     overlays_active: bool,
     cx: &mut gpui::Context<Controller>,
 ) -> impl IntoElement + use<> {
-    let mut inner = div().flex().flex_col().gap_2().w_full();
+    let mut inner = div().flex().flex_col().gap_2().w_full().pb(px(2.0));
 
     for (i, mon) in monitors.iter().enumerate() {
         let is_selected = selected.get(i).copied().unwrap_or(false);
