@@ -8,7 +8,8 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{SW_SHOW, SetForegroundWindow, ShowWindow};
 
 use gpui::prelude::*;
-use gpui::{Bounds, FontWeight, Pixels, div, px, rgb};
+use gpui::{Animation, AnimationExt, AnyElement, Bounds, FontWeight, Pixels, div, px, rgb};
+use std::f32::consts::PI;
 
 use crate::monitor::MonitorInfo;
 use crate::overlay::OverlayManager;
@@ -48,6 +49,10 @@ pub struct Controller {
     /// causes GPUI to create a fresh `AnimationState` so the transition
     /// replays from the beginning on each click.
     switch_click_count: u64,
+    /// Incremented each time the user tries to enable protection without any
+    /// monitors selected.  Baked into the animation `ElementId` to restart
+    /// the shake transition from the beginning on each failed attempt.
+    shake_count: u64,
     /// Cached bounds of the slider track element (updated every frame via
     /// `on_children_prepainted`). Stored in an `Rc<Cell>` so the prepaint
     /// closure can write to it without requiring `&mut self`.
@@ -139,6 +144,7 @@ impl Controller {
             hwnd_rx: rx,
             main_hwnd,
             switch_click_count: 0,
+            shake_count: 0,
             slider_bounds: Rc::new(Cell::new(None)),
         }
     }
@@ -160,6 +166,7 @@ impl Render for Controller {
         let opacity_val = self.opacity;
         let any_selected = self.selected.iter().any(|&s| s);
         let switch_click_count = self.switch_click_count;
+        let shake_count = self.shake_count;
 
         // Pre-compute which monitors currently have a live overlay.
         let overlay_alive: Vec<bool> = self
@@ -246,6 +253,7 @@ impl Render for Controller {
                         this.overlay_manager.deactivate();
                         this.overlays_active = false;
                         this.switch_click_count += 1;
+                        this.shake_count = 0; // clear any leftover shake state
                     } else if this.selected.iter().any(|&s| s) {
                         this.overlays_active = true;
                         this.overlay_manager.activate(
@@ -255,6 +263,10 @@ impl Render for Controller {
                             &this.hwnd_tx,
                         );
                         this.switch_click_count += 1;
+                        this.shake_count = 0; // clear any leftover shake state
+                    } else {
+                        // No monitors selected — shake the hint label.
+                        this.shake_count += 1;
                     }
                     cx.notify();
                 }),
@@ -309,16 +321,56 @@ impl Render for Controller {
                             .text_color(rgb(0xcccccc))
                             .child(format!("Monitors ({})", self.monitors.len())),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x666666))
-                            .child(if is_active {
-                                "🔒 Selection locked"
-                            } else {
-                                "Select monitors to protect"
-                            }),
-                    ),
+                    .child({
+                        // Build the hint label.  When the user clicks the
+                        // switch with no monitors selected we play a
+                        // horizontal-shake + orange-to-grey colour fade.
+                        let hint: AnyElement = if shake_count > 0 && !is_active {
+                            div()
+                                .text_sm()
+                                .child("Select monitors to protect")
+                                .with_animation(
+                                    ("monitor_hint_shake", shake_count),
+                                    Animation::new(Duration::from_millis(500)),
+                                    |el, delta| {
+                                        // Decaying sinusoidal offset (3 oscillations).
+                                        let offset = (delta * PI * 6.0).sin() * 8.0 * (1.0 - delta);
+                                        // Colour: orange (0xee6b2f) → grey (0x666666).
+                                        let t = delta.clamp(0.0, 1.0);
+                                        let r = (0xeeu8 as f32
+                                            + (0x66u8 as f32 - 0xeeu8 as f32) * t)
+                                            .round()
+                                            as u32;
+                                        let g = (0x6bu8 as f32
+                                            + (0x66u8 as f32 - 0x6bu8 as f32) * t)
+                                            .round()
+                                            as u32;
+                                        let b = (0x2fu8 as f32
+                                            + (0x66u8 as f32 - 0x2fu8 as f32) * t)
+                                            .round()
+                                            as u32;
+                                        let color = (r << 16) | (g << 8) | b;
+                                        // relative() + left() supports negative offsets
+                                        // (ml() clamps to 0 in the flex engine).
+                                        el.text_color(rgb(color)).relative().left(px(offset))
+                                    },
+                                )
+                                .into_any_element()
+                        } else if is_active {
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x666666))
+                                .child("🔒 Selection locked")
+                                .into_any_element()
+                        } else {
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x666666))
+                                .child("Select monitors to protect")
+                                .into_any_element()
+                        };
+                        hint
+                    }),
             )
             // Monitor list
             .child(mon_list)
