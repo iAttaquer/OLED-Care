@@ -33,11 +33,12 @@ pub fn monitor_list(
         let is_selected = selected.get(i).copied().unwrap_or(false);
         let has_overlay = overlay_hwnds.get(i).copied().unwrap_or(false);
 
-        let display_name = if mon.name.is_empty() {
-            format!("Monitor {}", i + 1)
+        let display_name = if !mon.friendly_name.is_empty() {
+            mon.friendly_name.clone()
+        } else if !mon.name.is_empty() {
+            mon.name.replace("\\\\.\\\\.\\", "")
         } else {
-            let clean = mon.name.replace("\\\\.\\", "");
-            format!("{} ({})", clean, i + 1)
+            format!("Monitor {}", i + 1)
         };
 
         let resolution = format!("{}x{}", mon.width, mon.height);
